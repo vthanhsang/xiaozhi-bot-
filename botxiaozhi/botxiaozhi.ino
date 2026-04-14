@@ -168,11 +168,11 @@ void setup() {
   };
 
   i2s_pin_config_t spk_pins = {
-    .mck_io_num   = I2S_PIN_NO_CHANGE,
-    .bck_io_num   = SPK_BCLK,
-    .ws_io_num    = SPK_LRC,
-    .data_out_num = SPK_DOUT,
-    .data_in_num  = I2S_PIN_NO_CHANGE
+    spk_pins.mck_io_num   = I2S_PIN_NO_CHANGE,
+    spk_pins.bck_io_num   = SPK_BCLK,
+    spk_pins.ws_io_num    = SPK_LRC,
+    spk_pins.data_out_num = SPK_DOUT,
+    spk_pins.data_in_num  = I2S_PIN_NO_CHANGE
   };
 
   ESP_ERROR_CHECK(i2s_driver_install(I2S_SPK_PORT, &spk_config, 0, NULL));
