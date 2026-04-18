@@ -4,13 +4,14 @@
 
 const char* WIFI_SSID = "sang";
 const char* WIFI_PASS = "sang201104";
-const char* WS_HOST   = "192.168.233.20";
+const char* WS_HOST   = "192.168.114.20";
 const uint16_t WS_PORT = 8000;
 const char* WS_PATH   = "/ws/audio";
 
 #define I2S_SD       6
 #define I2S_WS       4
 #define I2S_SCK      5
+
 #define I2S_BCLK_SPK 15
 #define I2S_LRC_SPK  16
 #define I2S_DOUT_SPK 7
@@ -75,10 +76,22 @@ void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
       break;
 
     case WStype_BIN:
-      // Chỉ xử lý khi đang chờ reply
-      if (currentState == STATE_WAITING) {
-        Serial.printf("[WS] Audio reply: %u bytes\n", length);
-        playAudio(payload, length);
+      // Nếu server gửi gói rỗng → kết thúc audio
+      if (length == 0) {
+        Serial.println("[WS] Audio END");
+
+        i2s_zero_dma_buffer(I2S_PORT_TX); // xóa buffer loa
+        currentState = STATE_LISTENING;
+        break;
+      }
+
+      // Nhận từng chunk → phát luôn
+      if (currentState == STATE_WAITING || currentState == STATE_PLAYING) {
+        size_t written;
+        i2s_write(I2S_PORT_TX, payload, length, &written, portMAX_DELAY);
+
+        currentState = STATE_PLAYING;
+        Serial.printf("[WS] Playing chunk: %u bytes\n", length);
       }
       break;
 
@@ -95,7 +108,7 @@ void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
   }
 }
 
-bool hasVoice(int16_t* buf, size_t samples, int16_t threshold = 500) {
+bool hasVoice(int16_t* buf, size_t samples, int16_t threshold = 2000) {
   for (size_t i = 0; i < samples; i++) {
     if (abs(buf[i]) > threshold) return true;
   }
