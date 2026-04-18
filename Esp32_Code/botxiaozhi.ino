@@ -1,237 +1,199 @@
+#include <driver/i2s.h>
 #include <WiFi.h>
 #include <WebSocketsClient.h>
-#include <TFT_eSPI.h>
-#include "RoboEyesTFT_eSPI.h"
-#include <driver/i2s.h>
 
-// ===== WIFI =====
-const char* ssid     = "sang";
-const char* password = "11111111";
+const char* WIFI_SSID = "sang";
+const char* WIFI_PASS = "sang201104";
+const char* WS_HOST   = "192.168.233.20";
+const uint16_t WS_PORT = 8000;
+const char* WS_PATH   = "/ws/audio";
 
-// ===== WEBSOCKET =====
-WebSocketsClient webSocket;
-bool isConnected = false;
+#define I2S_SD       6
+#define I2S_WS       4
+#define I2S_SCK      5
+#define I2S_BCLK_SPK 15
+#define I2S_LRC_SPK  16
+#define I2S_DOUT_SPK 7
+#define I2S_SD_SPK   46
+#define I2S_PORT_RX  I2S_NUM_0
+#define I2S_PORT_TX  I2S_NUM_1
 
-// ===== TFT =====
-TFT_eSPI tft = TFT_eSPI();
-TFT_RoboEyes roboEyes(tft, false, 3);
+#define SAMPLE_RATE     16000
+#define CHUNK_SIZE      512
+#define RECORD_SECONDS  3
+#define SEND_BUF_SIZE   (SAMPLE_RATE * 2 * RECORD_SECONDS)
 
-// ===== I2S MIC =====
-#define I2S_MIC_PORT  I2S_NUM_0
-#define MIC_BCLK      5
-#define MIC_LRC       4
-#define MIC_DIN       6
+// ===== State Machine =====
+enum State { STATE_LISTENING, STATE_WAITING, STATE_PLAYING };
+State currentState = STATE_LISTENING;
 
-// ===== I2S SPK =====
-#define I2S_SPK_PORT  I2S_NUM_1
-#define SPK_BCLK      15
-#define SPK_LRC       16
-#define SPK_DOUT      7
-#define SPK_SD        46
+int16_t chunkBuf[CHUNK_SIZE];
+uint8_t sendBuf[SEND_BUF_SIZE];
+uint32_t sendBufPos = 0;
+uint32_t lastSendMs = 0;
+uint32_t waitingStartMs = 0;  
 
-// ===== AUDIO =====
-const int SAMPLE_RATE         = 16000;
-const int RECORD_DURATION_SEC = 3;
-const int AUDIO_BUFFER_SIZE   = RECORD_DURATION_SEC * SAMPLE_RATE * 2;
+WebSocketsClient ws;
+bool wsConnected = false;
 
-int16_t* audio_buffer = NULL;
+// ===== Phát audio — BLOCKING cho đến khi hết =====
+void playAudio(uint8_t* data, size_t len) {
+  currentState = STATE_PLAYING;
+  Serial.printf("[PLAY] Playing %u bytes\n", len);
 
-// ===== TASK =====
-TaskHandle_t eyeTaskHandle;
-TaskHandle_t wsTaskHandle;
-TaskHandle_t audioTaskHandle;
-
-// ===== CONTROL FLAG (THAY SUSPEND) =====
-bool pauseEye = false;
-
-// ===== TIMER =====
-unsigned long lastChange = 0;
-int moodIndex = 0;
-
-// ================= MOOD =================
-void changeMood(int i) {
-  switch (i) {
-    case 0: roboEyes.setMood(DEFAULT); break;
-    case 1: roboEyes.setMood(HAPPY);   break;
-    case 2: roboEyes.setMood(ANGRY);   break;
-    case 3: roboEyes.setMood(TIRED);   break;
+  size_t written = 0;
+  const size_t PLAY_CHUNK = 1024;
+  for (size_t i = 0; i < len; i += PLAY_CHUNK) {
+    size_t toWrite = min(PLAY_CHUNK, len - i);
+    i2s_write(I2S_PORT_TX, data + i, toWrite, &written, portMAX_DELAY);
+    ws.loop(); // giữ WebSocket sống trong khi phát
   }
+
+  // Xả DMA buffer, đợi loa phát hết
+  delay(200);
+
+  Serial.println("[PLAY] Done → back to LISTENING");
+  sendBufPos = 0;     // xóa buffer mic (tránh thu tiếng loa cũ)
+  lastSendMs = millis();
+  currentState = STATE_LISTENING;
 }
 
-// ================= EYE TASK =================
-void eyeTask(void* pvParameters) {
-  while (true) {
-
-    if (!pauseEye) {
-      roboEyes.update();
-
-      if (millis() - lastChange > 5000) {
-        moodIndex = (moodIndex + 1) % 4;
-        changeMood(moodIndex);
-        lastChange = millis();
-      }
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(30));
-  }
-}
-
-// ================= WS TASK =================
-void webSocketTask(void* pvParameters) {
-  while (true) {
-    webSocket.loop();
-    vTaskDelay(10 / portTICK_PERIOD_MS);
-  }
-}
-
-// ================= AUDIO TASK =================
-void audioTask(void* pvParameters) {
-  while (true) {
-
-    if (!isConnected) {
-      Serial.println("[WS] Waiting...");
-      vTaskDelay(1000 / portTICK_PERIOD_MS);
-      continue;
-    }
-
-    record_and_send();
-    vTaskDelay(15000 / portTICK_PERIOD_MS);
-  }
-}
-
-// ================= WS EVENT =================
-void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED:
-      isConnected = true;
-      Serial.println("[WS] Connected!");
+      Serial.println("[WS] Connected");
+      wsConnected = true;
       break;
 
     case WStype_DISCONNECTED:
-      isConnected = false;
-      Serial.println("[WS] Disconnected!");
-      break;
-
-    case WStype_TEXT:
-      Serial.printf("[WS] Text: %s\n", payload);
+      Serial.println("[WS] Disconnected");
+      wsConnected = false;
+      // Nếu đang chờ mà mất kết nối → về LISTENING
+      if (currentState == STATE_WAITING) {
+        currentState = STATE_LISTENING;
+      }
       break;
 
     case WStype_BIN:
-      Serial.printf("[WS] Audio received: %d bytes\n", length);
+      // Chỉ xử lý khi đang chờ reply
+      if (currentState == STATE_WAITING) {
+        Serial.printf("[WS] Audio reply: %u bytes\n", length);
+        playAudio(payload, length);
+      }
+      break;
+
+    case WStype_TEXT:
+      Serial.printf("[WS] Text: %s\n", (char*)payload);
+      // Nếu server báo lỗi / không có gì → về LISTENING
+      if (currentState == STATE_WAITING) {
+        currentState = STATE_LISTENING;
+      }
+      break;
+
+    default:
       break;
   }
 }
 
-// ================= RECORD & SEND =================
-void record_and_send() {
-
-  audio_buffer = (int16_t*)heap_caps_malloc(AUDIO_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
-  if (!audio_buffer) {
-    Serial.println("[ERROR] PSRAM alloc failed!");
-    return;
+bool hasVoice(int16_t* buf, size_t samples, int16_t threshold = 500) {
+  for (size_t i = 0; i < samples; i++) {
+    if (abs(buf[i]) > threshold) return true;
   }
-
-  // --- Pause eye bằng FLAG ---
-  pauseEye = true;
-
-  roboEyes.setMood(ANGRY);
-  roboEyes.update();
-
-  Serial.println("[REC] Recording...");
-
-  size_t bytes_read = 0;
-
-while (bytes_read < AUDIO_BUFFER_SIZE) {
-
-  size_t remaining = AUDIO_BUFFER_SIZE - bytes_read;
-  size_t to_read = remaining > 1024 ? 1024 : remaining;
-
-  size_t chunk = 0;
-
-  i2s_read(I2S_MIC_PORT,
-           (uint8_t*)audio_buffer + bytes_read,
-           to_read,
-           &chunk,
-           portMAX_DELAY);
-
-  bytes_read += chunk;
-
-  vTaskDelay(1);
+  return false;
 }
 
-  Serial.printf("[REC] Done: %d bytes\n", bytes_read);
+void setupI2S() {
+  i2s_config_t rx_cfg = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = 0,
+    .dma_buf_count = 8,
+    .dma_buf_len = CHUNK_SIZE,
+    .use_apll = false
+  };
+  i2s_pin_config_t rx_pins = {
+    .bck_io_num = I2S_SCK, .ws_io_num = I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE, .data_in_num = I2S_SD
+  };
+  i2s_driver_install(I2S_PORT_RX, &rx_cfg, 0, NULL);
+  i2s_set_pin(I2S_PORT_RX, &rx_pins);
 
-  roboEyes.setMood(HAPPY);
-  roboEyes.update();
-
-  bool ok = webSocket.sendBIN((uint8_t*)audio_buffer, bytes_read);
-
-  if (ok) Serial.println("[WS] Sent OK");
-  else    Serial.println("[WS] Send FAIL");
-
-  free(audio_buffer);
-  audio_buffer = NULL;
-
-  pauseEye = false;
-
-  moodIndex = 0;
-  changeMood(moodIndex);
-  lastChange = millis();
+  i2s_config_t tx_cfg = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = 0,
+    .dma_buf_count = 8,
+    .dma_buf_len = CHUNK_SIZE,
+    .use_apll = false
+  };
+  i2s_pin_config_t tx_pins = {
+    .bck_io_num = I2S_BCLK_SPK, .ws_io_num = I2S_LRC_SPK,
+    .data_out_num = I2S_DOUT_SPK, .data_in_num = I2S_PIN_NO_CHANGE
+  };
+  i2s_driver_install(I2S_PORT_TX, &tx_cfg, 0, NULL);
+  i2s_set_pin(I2S_PORT_TX, &tx_pins);
 }
 
-// ================= SETUP =================
 void setup() {
   Serial.begin(115200);
+  pinMode(I2S_SD_SPK, OUTPUT);
+  digitalWrite(I2S_SD_SPK, HIGH);
+  setupI2S();
 
-  pinMode(SPK_SD, OUTPUT);
-  digitalWrite(SPK_SD, LOW);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting WiFi");
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.printf("\nWiFi OK: %s\n", WiFi.localIP().toString().c_str());
 
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  Serial.println("\n[WiFi] Connected!");
-  Serial.println(WiFi.localIP());
-
-  webSocket.begin("192.168.233.20", 8000, "/ws/audio");
-  webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(3000);
-
-  // TFT
-  tft.init();
-  tft.setRotation(0);
-  roboEyes.begin(30);
-
-  // I2S MIC
-  i2s_config_t mic_config = {
-    mic_config.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-    mic_config.sample_rate = SAMPLE_RATE,
-    mic_config.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-    mic_config.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    mic_config.communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    mic_config.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    mic_config.dma_buf_count = 8,
-    mic_config.dma_buf_len = 1024
-  };
-
-  i2s_pin_config_t mic_pins = {
-    mic_pins.bck_io_num = MIC_BCLK,
-    mic_pins.ws_io_num = MIC_LRC,
-    mic_pins.data_in_num = MIC_DIN,
-    mic_pins.data_out_num = I2S_PIN_NO_CHANGE
-  };
-  
-
-  i2s_driver_install(I2S_MIC_PORT, &mic_config, 0, NULL);
-  i2s_set_pin(I2S_MIC_PORT, &mic_pins);
-
-  // TASKS
-  xTaskCreatePinnedToCore(eyeTask,       "eyeTask", 4096, NULL, 1, &eyeTaskHandle, 1);
-  xTaskCreatePinnedToCore(webSocketTask, "wsTask", 4096, NULL, 2, &wsTaskHandle, 0);
-  xTaskCreatePinnedToCore(audioTask,     "audioTask", 8192, NULL, 1, &audioTaskHandle, 1);
+  ws.begin(WS_HOST, WS_PORT, WS_PATH);
+  ws.onEvent(onWsEvent);
+  ws.setReconnectInterval(3000);
 }
 
-// ================= LOOP =================
-void loop() {}
+void loop() {
+  ws.loop();
+
+  // Timeout WAITING
+  if (currentState == STATE_WAITING && (millis() - waitingStartMs > 30000)) {
+    Serial.println("[TIMEOUT] No reply in 30s → LISTENING");
+    currentState = STATE_LISTENING;
+    sendBufPos = 0;
+    lastSendMs = millis();
+  }
+
+  if (currentState != STATE_LISTENING) return;
+
+  size_t bytesRead = 0;
+  i2s_read(I2S_PORT_RX, chunkBuf, sizeof(chunkBuf), &bytesRead, 10);
+
+  // Luôn tích lũy vào buffer, không lọc VAD ở đây
+  if (bytesRead > 0) {
+    size_t toCopy = min(bytesRead, (size_t)(SEND_BUF_SIZE - sendBufPos));
+    memcpy(sendBuf + sendBufPos, chunkBuf, toCopy);
+    sendBufPos += toCopy;
+  }
+
+  uint32_t now = millis();
+  bool timeUp  = (now - lastSendMs) >= (RECORD_SECONDS * 1000);
+  bool bufFull = sendBufPos >= SEND_BUF_SIZE;
+
+  if (wsConnected && (timeUp || bufFull)) {
+    // Chỉ gửi nếu buffer có tiếng thực sự
+    if (hasVoice((int16_t*)sendBuf, sendBufPos / 2, 500)) {
+      Serial.printf("[MIC] Sending %u bytes → WAITING\n", sendBufPos);
+      ws.sendBIN(sendBuf, sendBufPos);
+      currentState = STATE_WAITING;
+      waitingStartMs = millis();  // ← fix bug 2
+    } else {
+      Serial.println("[MIC] Silence, skip");
+    }
+    sendBufPos = 0;
+    lastSendMs = now;
+  }
+}
